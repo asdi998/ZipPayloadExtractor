@@ -30,6 +30,8 @@ ZipPayloadExtractor —— 从 Android OTA ZIP 包（payload.bin）中快速提�
     成大块读取（请求数减少、网络顺序化）；下载线程与解压线程通过有界队列解耦；
     远程用每线程独立 Session（并发安全），本地用只读 mmap。
   * ZERO 操作不下载也不写零：输出文件先 truncate 到分区镜像大小，零区自动成为文件洞。
+  * 三级重试抗抖 CDN：单次 Range 读取应用层重试（指数退避）→ 组级读取重试 →
+    整次提取失败自动重试；单组失败不再导致整个分区前功尽弃。
   * 修复：多 dst_extents 写入、压缩方法/未压缩大小的字段索引、ZIP64 本地头尺寸、
     每块下载重复开关输出文件等原有问题。
 """
@@ -83,7 +85,8 @@ COMPRESSION_METHODS = {
 
 HEADER_FIXED_SIZE = 24          # payload.bin 固定头大小（magic4+version8+manifest_size8+sig_size4）
 CHUNK_SIZE = 1024 * 1024 * 4    # 普通文件分块下载的块大小（4MB）
-MAX_RETRIES = 3
+MAX_RETRIES = 6                 # 单次 Range 读取的应用层重试次数（CDN 断连场景）
+GROUP_READ_TRIES = 3            # 分区提取时一组数据的读取尝试次数（组级重试）
 DEFAULT_THREADS = 8
 __version__ = "1.0.0"
 HEAD_SCAN_STEPS = (64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)  # 快速定位扩容窗口
@@ -708,15 +711,21 @@ class PayloadExtractor:
                     if stop.is_set():
                         return
                     gstart, glen, items = groups[i]
-                    try:
-                        data = fetcher.read(base_offset + gstart,
-                                            base_offset + gstart + glen - 1)
-                    except DownloadInterrupted:
-                        return
-                    except Exception as e:
-                        print(f"读取数据失败: {e}")
-                        stop.set()
-                        return
+                    data = None
+                    for attempt in range(GROUP_READ_TRIES):
+                        try:
+                            data = fetcher.read(base_offset + gstart,
+                                                base_offset + gstart + glen - 1)
+                            break
+                        except DownloadInterrupted:
+                            return
+                        except Exception as e:
+                            if attempt >= GROUP_READ_TRIES - 1:
+                                print(f"读取数据失败: {e}")
+                                stop.set()
+                                return
+                            print(f"读取数据失败，重试 {attempt + 1}/{GROUP_READ_TRIES - 1}: {e}")
+                            time.sleep(1.5 * (2 ** attempt))
                     stats.add(glen)
                     for op, rel, length in items:
                         work.put((op, data[rel:rel + length]))
@@ -1275,6 +1284,8 @@ def _build_parser():
                         help="输出路径（默认：分区为 NAME.img，文件为 NAME）")
     parser.add_argument("-t", "--threads", metavar="N", type=int, default=DEFAULT_THREADS,
                         help=f"下载/解压线程数（默认 {DEFAULT_THREADS}）")
+    parser.add_argument("--retries", metavar="N", type=int, default=MAX_RETRIES,
+                        help=f"单次数据读取的重试次数（默认 {MAX_RETRIES}）")
     parser.add_argument("-f", "--force-file", action="store_true",
                         help="强制把 NAME 当作 ZIP 条目（文件）而非分区")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -1290,6 +1301,32 @@ def _make_progress_cb():
     return callback
 
 
+EXTRACT_RETRIES = 2  # 整次提取因网络失败时的自动重试次数
+
+
+def _run_extraction(tool, mode, name, output):
+    """执行一次提取；因网络失败（返回 False 且非用户中断）时自动重试。
+
+    异常（文件/分区不存在等）不重试，原样抛出由调用方处理。
+    """
+    attempts = 0
+    while True:
+        if tool.stop_event.is_set():
+            return False
+        if mode == "file":
+            ok = tool.extract_file(name, output)
+        else:
+            ok = tool.extract_partition(name, output)
+        if ok or tool.stop_event.is_set():
+            return ok
+        attempts += 1
+        if attempts > EXTRACT_RETRIES:
+            return False
+        print(f"\n提取失败（网络原因），{attempts * 3} 秒后自动重试 "
+              f"{attempts}/{EXTRACT_RETRIES} ...")
+        time.sleep(3 * attempts)
+
+
 def _run_cli(argv=None):
     args = _build_parser().parse_args(argv)
 
@@ -1297,7 +1334,7 @@ def _run_cli(argv=None):
         print(f"错误: 本地文件不存在 - {args.source}")
         return 1
 
-    tool = ZipPayloadTool(args.source, threads=args.threads,
+    tool = ZipPayloadTool(args.source, threads=args.threads, max_retries=args.retries,
                           on_progress=None if args.quiet else _make_progress_cb())
 
     def signal_handler(sig, frame):
@@ -1341,7 +1378,7 @@ def _run_cli(argv=None):
         looks_like_file = "/" in name or "." in name
 
         if args.force_file:
-            ok = tool.extract_file(name, file_out)
+            ok = _run_extraction(tool, "file", name, file_out)
             print()
             if ok:
                 print(f"文件已保存至: {file_out}")
@@ -1349,15 +1386,15 @@ def _run_cli(argv=None):
             print("错误: 文件提取失败")
             return 1
 
-        if looks_like_file and tool.extract_file(name, file_out):
+        if looks_like_file and _run_extraction(tool, "file", name, file_out):
             print()
             print(f"文件已保存至: {file_out}")
             return 0
-        if tool.extract_partition(name, part_out):
+        if _run_extraction(tool, "partition", name, part_out):
             print()
             print(f"文件已保存至: {part_out}")
             return 0
-        if not looks_like_file and tool.extract_file(name, file_out):
+        if not looks_like_file and _run_extraction(tool, "file", name, file_out):
             print()
             print(f"文件已保存至: {file_out}")
             return 0
