@@ -590,29 +590,46 @@ class PayloadExtractor:
         return groups
 
     @staticmethod
-    def _write_operation(f, op, data, block_size, lock):
-        """按目标 extent 顺序把解压数据写入输出文件（支持多 extent）"""
+    def _write_operation(f, op, data, block_size, lock, flush=False):
+        """按目标 extent 顺序把解压数据写入输出文件（支持多 extent）。
+
+        返回 (起始字节, 结束字节)，供上层跟踪已写区域；无 extent 时返回 None。
+        flush=True 时在写锁内立即落盘（流式模式需要让其他读句柄立即可见）。
+        """
         if not op.dst_extents:
-            return
+            return None
         pos = 0
+        start = None
+        end = 0
         with lock:
             for ext in op.dst_extents:
                 n = ext.num_blocks * block_size
-                f.seek(ext.start_block * block_size)
+                off = ext.start_block * block_size
+                f.seek(off)
                 f.write(data[pos:pos + n])
+                if start is None:
+                    start = off
+                end = off + n
                 pos += n
+            if flush:
+                f.flush()
         if pos != len(data):
             raise ValueError("解压数据大小与目标范围不匹配")
+        return start, end
 
     @staticmethod
     def extract_partition(fetcher, partition, output_path, base_offset, block_size,
-                          threads, on_progress=None):
+                          threads, on_progress=None, on_written=None):
         """提取分区镜像。
 
         base_offset 为 payload.bin 数据区起始（payload_offset + partitions_start）。
         ZERO 操作直接跳过（输出文件已按镜像大小 truncate，零区自动成洞）；
         其余操作按 data_offset 排序合并分组：抓取线程拉数据入有界队列，
         处理线程解压并写入，网络与 CPU 并行且互不阻塞。
+
+        on_progress(current, total, speed, elapsed)：下载字节进度。
+        on_written(prefix_bytes)：已连续写满的前缀字节数（从文件头算起，
+        ZERO 区域因 truncate 已确定为零，会提前计入），可用于流式推送。
         """
         stop = fetcher.stop_event
         ops = [op for op in partition.operations
@@ -620,6 +637,53 @@ class PayloadExtractor:
         image_size = PayloadExtractor._image_size(partition, block_size)
         total = sum(op.data_length for op in ops)
         stats = ProgressStats(total)
+
+        # 预登记 ZERO 区域：truncate 后这些区域内容确定为零，计入已写前缀
+        zero_regions = []
+        for op in partition.operations:
+            if op.type == op.ZERO:
+                for ext in op.dst_extents:
+                    zero_regions.append((ext.start_block * block_size,
+                                         (ext.start_block + ext.num_blocks) * block_size))
+
+        # 已写区域跟踪：合并区间并计算从文件头开始的连续前缀
+        region_lock = threading.Lock()
+        regions = []
+        prefix = 0
+
+        def register_written(start, end):
+            nonlocal prefix
+            if start is None:
+                return
+            with region_lock:
+                regions.append([start, end])
+                regions.sort(key=lambda r: r[0])
+                merged = []
+                for r in regions:
+                    if merged and r[0] <= merged[-1][1]:
+                        merged[-1][1] = max(merged[-1][1], r[1])
+                    else:
+                        merged.append(r)
+                regions[:] = merged
+                p = 0
+                for s, e in regions:
+                    if s > p:
+                        break
+                    p = max(p, e)
+                changed = True
+                while changed:  # 连续前缀继续延伸进 ZERO 区域
+                    changed = False
+                    for s, e in zero_regions:
+                        if s <= p < e:
+                            p = e
+                            changed = True
+                if p > prefix:
+                    prefix = p
+                    if on_written:
+                        try:
+                            on_written(p)
+                        except Exception:
+                            pass
 
         with open(output_path, "w+b") as out_file:
             out_file.truncate(image_size)
@@ -666,8 +730,12 @@ class PayloadExtractor:
                     op, data = item
                     try:
                         processed = PayloadExtractor.process_operation(op, data, block_size)
-                        PayloadExtractor._write_operation(out_file, op, processed,
-                                                          block_size, write_lock)
+                        written = PayloadExtractor._write_operation(
+                            out_file, op, processed, block_size, write_lock,
+                            flush=on_written is not None,
+                        )
+                        if written:
+                            register_written(*written)
                     except Exception as e:
                         print(f"操作失败: {e}")
                         stop.set()
@@ -713,6 +781,11 @@ class PayloadExtractor:
         if on_progress:
             try:
                 on_progress(total, total, 0, time.time() - start_time)
+            except Exception:
+                pass
+        if on_written and not stop.is_set():
+            try:
+                on_written(image_size)
             except Exception:
                 pass
         return not stop.is_set()
@@ -895,6 +968,30 @@ class ZipPayloadTool:
         self.payload_metadata_size = None  # 来自 ota-property-files 的 payload_metadata.bin 大小
         self.metadata_warning = None       # 定位结果与索引不一致时的警告文本
 
+    # ---------- payload 内部信息（只读） ----------
+    # 供需要操作级访问的调用方（如 web 服务的内核版本提取）使用，
+    # 调用 list_partitions() 后即可读取。
+
+    @property
+    def payload_offset(self):
+        return self._payload_offset
+
+    @property
+    def payload_size(self):
+        return self._payload_size
+
+    @property
+    def partitions_start(self):
+        return self._partitions_start
+
+    @property
+    def partitions(self):
+        return self._partitions
+
+    @property
+    def block_size(self):
+        return self._block_size
+
     # ---------- 生命周期 ----------
 
     def load(self):
@@ -1070,19 +1167,21 @@ class ZipPayloadTool:
 
     def list_partitions(self):
         """返回分区信息列表 ``[{name, image_size, download_size}, ...]``；
-        未找到 payload.bin 或清单解析失败返回 None。"""
+        未找到 payload.bin 或清单解析失败返回 None。
+        image_size 与提取产物实际大小一致（清单未记录大小时按 extent 推算）。"""
         if not self._load_payload_info():
             return None
         return [{
             "name": p.partition_name,
-            "image_size": p.new_partition_info.size,
+            "image_size": PayloadExtractor._image_size(p, self._block_size),
             "download_size": sum(op.data_length for op in p.operations),
         } for p in self._partitions]
 
-    def extract_partition(self, name, output=None):
+    def extract_partition(self, name, output=None, on_written=None):
         """提取指定分区为镜像文件，成功返回 True。
         分区不存在抛 PartitionNotFoundError；未找到 payload.bin 抛
-        FileNotFoundInZipError。默认输出 ``name.img``。"""
+        FileNotFoundInZipError。默认输出 ``name.img``。
+        on_written：可选回调 (已写连续前缀字节数)，用于流式场景。"""
         if output is None:
             output = name + ".img"
         if not self._load_payload_info():
@@ -1095,7 +1194,7 @@ class ZipPayloadTool:
             return PayloadExtractor.extract_partition(
                 self.fetcher, target, output,
                 self._payload_offset + self._partitions_start,
-                self._block_size, self.threads, self.on_progress,
+                self._block_size, self.threads, self.on_progress, on_written,
             )
         except DownloadInterrupted:
             self._remove_partial(output)
