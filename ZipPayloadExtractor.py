@@ -32,6 +32,8 @@ ZipPayloadExtractor —— 从 Android OTA ZIP 包（payload.bin）中快速提�
   * ZERO 操作不下载也不写零：输出文件先 truncate 到分区镜像大小，零区自动成为文件洞。
   * 三级重试抗抖 CDN：单次 Range 读取应用层重试（指数退避）→ 组级读取重试 →
     整次提取失败自动重试；单组失败不再导致整个分区前功尽弃。
+  * 大块读取采用流式接收（128KB 粒度增量计进度）：合并请求的数量优势不变，
+    但链接限速时进度条仍平滑推进，不再"一组不读完进度不动"。
   * 修复：多 dst_extents 写入、压缩方法/未压缩大小的字段索引、ZIP64 本地头尺寸、
     每块下载重复开关输出文件等原有问题。
 """
@@ -88,7 +90,7 @@ CHUNK_SIZE = 1024 * 1024 * 4    # 普通文件分块下载的块大小（4MB）
 MAX_RETRIES = 6                 # 单次 Range 读取的应用层重试次数（CDN 断连场景）
 GROUP_READ_TRIES = 3            # 分区提取时一组数据的读取尝试次数（组级重试）
 DEFAULT_THREADS = 8
-__version__ = "3.0.1"
+__version__ = "3.1.0"
 HEAD_SCAN_STEPS = (64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)  # 快速定位扩容窗口
 HEAD_SCAN_MAX = 4 * 1024 * 1024
 GROUP_TARGET = 8 * 1024 * 1024  # 合并读取的目标大小（8MB）
@@ -154,28 +156,37 @@ class ProgressUtils:
 
     @staticmethod
     def speed_from_history(history):
-        """由 (时间, 字节数) 采样列表估算速度（字节/秒）"""
+        """由 (时间, 累计字节) 采样列表估算速度（字节/秒）"""
         if len(history) < 2:
             return 0
         dt = history[-1][0] - history[0][0]
         if dt <= 0:
             return 0
-        return int(sum(b for _, b in history) / dt)
+        return int((history[-1][1] - history[0][1]) / dt)
 
 
 class ProgressStats:
-    """线程安全的下载进度统计（已下载字节数 + 速度采样）"""
+    """线程安全的下载进度统计（已下载字节数 + 速度采样）。
 
-    def __init__(self, total, samples=5):
+    采样按时间节流（默认 0.2s 一次），记录 (时间, 累计字节)，
+    避免流式高频计数时速度估算失真。
+    """
+
+    def __init__(self, total, samples=5, sample_interval=0.2):
         self.total = total
         self.downloaded = 0
         self._lock = threading.Lock()
         self._history = deque(maxlen=samples)
+        self._last_sample_t = 0.0
+        self._sample_interval = sample_interval
 
     def add(self, n):
+        now = time.time()
         with self._lock:
             self.downloaded += n
-            self._history.append((time.time(), n))
+            if now - self._last_sample_t >= self._sample_interval:
+                self._last_sample_t = now
+                self._history.append((now, self.downloaded))
 
     def snapshot(self):
         with self._lock:
@@ -239,6 +250,56 @@ class DataFetcher:
         if self.remote:
             return self._read_remote(start, end)
         return self._read_local(start, end)
+
+    def read_stream(self, start, end, stats):
+        """流式读取 [start, end]（含），边读边把字节数计入 stats（平滑进度）。
+
+        远程：保持单次 Range 请求（不破坏大块合并的优势），但通过流式接收
+        以 128KB 粒度增量上报进度 —— 链接限速时进度条也会持续移动；
+        某次尝试失败自动回滚已计字节并重试。本地：一次切片瞬时完成。
+        """
+        if not self.remote:
+            data = self._read_local(start, end)
+            stats.add(len(data))
+            return data
+
+        headers = {"Range": f"bytes={start}-{end}"}
+        expected = end - start + 1
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            if self.stop_event.is_set():
+                raise DownloadInterrupted("操作已被中断")
+            reported = 0
+            try:
+                r = self._session().get(self.source, headers=headers,
+                                        timeout=(5, 60), stream=True)
+                cl = r.headers.get("Content-Length")
+                if r.status_code == 200 and cl is not None and int(cl) != expected:
+                    r.close()
+                    raise IOError("服务器未正确响应 Range 请求")
+                r.raise_for_status()
+                chunks = []
+                for chunk in r.iter_content(chunk_size=128 * 1024):
+                    if self.stop_event.is_set():
+                        r.close()
+                        raise DownloadInterrupted("操作已被中断")
+                    if chunk:
+                        chunks.append(chunk)
+                        stats.add(len(chunk))
+                        reported += len(chunk)
+                r.close()
+                return b"".join(chunks)
+            except DownloadInterrupted:
+                raise
+            except requests.exceptions.RequestException as e:
+                if self.stop_event.is_set():
+                    raise DownloadInterrupted("操作已被中断") from e
+                if reported:
+                    stats.add(-reported)  # 回滚本次尝试的计数，避免重试重复计入
+                last_error = e
+                if attempt < self.max_retries:
+                    time.sleep(0.3 * (2 ** attempt))
+        raise IOError(f"读取远程数据失败 [{start}-{end}]: {last_error}")
 
     def _read_local(self, start, end=None):
         if self._mmap is not None:
@@ -508,7 +569,12 @@ class PayloadExtractor:
 
     @staticmethod
     def parse_payload_header(fetcher, payload_offset, file_size):
-        """解析 payload.bin 头部，返回 (数据起始偏移, 分区列表, block_size)。"""
+        """解析 payload.bin 头部。
+
+        返回 (数据起始偏移, 分区列表, block_size, manifest 指纹)；
+        manifest 指纹为清单字节的 sha256，可唯一标识该 OTA 包
+        （换链接重下同包指纹不变，换包必变）。
+        """
         end = min(payload_offset + 512 * 1024 - 1, file_size - 1)
         header = fetcher.read(payload_offset, end)
         if len(header) < HEADER_FIXED_SIZE or header[:4] != b"CrAU":
@@ -525,7 +591,8 @@ class PayloadExtractor:
         dam.ParseFromString(manifest)
         if not dam.partitions:
             raise ValueError("未找到有效分区")
-        return partitions_start, dam.partitions, dam.block_size or 4096
+        manifest_hash = hashlib.sha256(manifest).hexdigest()
+        return partitions_start, dam.partitions, dam.block_size or 4096, manifest_hash
 
     @staticmethod
     def process_operation(op, data, block_size):
@@ -714,8 +781,11 @@ class PayloadExtractor:
                     data = None
                     for attempt in range(GROUP_READ_TRIES):
                         try:
-                            data = fetcher.read(base_offset + gstart,
-                                                base_offset + gstart + glen - 1)
+                            # 流式读取：边读边更新进度（限速时进度仍平滑推进），
+                            # 失败由 read_stream 自动回滚计数并重试
+                            data = fetcher.read_stream(
+                                base_offset + gstart, base_offset + gstart + glen - 1,
+                                stats)
                             break
                         except DownloadInterrupted:
                             return
@@ -726,7 +796,6 @@ class PayloadExtractor:
                                 return
                             print(f"读取数据失败，重试 {attempt + 1}/{GROUP_READ_TRIES - 1}: {e}")
                             time.sleep(1.5 * (2 ** attempt))
-                    stats.add(glen)
                     for op, rel, length in items:
                         work.put((op, data[rel:rel + length]))
 
@@ -976,6 +1045,7 @@ class ZipPayloadTool:
         self._block_size = None
         self.payload_metadata_size = None  # 来自 ota-property-files 的 payload_metadata.bin 大小
         self.metadata_warning = None       # 定位结果与索引不一致时的警告文本
+        self._manifest_hash = None         # payload manifest 指纹（包唯一标识）
 
     # ---------- payload 内部信息（只读） ----------
     # 供需要操作级访问的调用方（如 web 服务的内核版本提取）使用，
@@ -1000,6 +1070,15 @@ class ZipPayloadTool:
     @property
     def block_size(self):
         return self._block_size
+
+    @property
+    def package_id(self):
+        """当前包的唯一指纹（payload manifest 的 sha256）。
+
+        换链接重下同一个包指纹不变；换包（哪怕分区大小相同）指纹必变，
+        可用于区分本地已下载文件是否属于当前包。调用 list_partitions() 后可用。
+        """
+        return self._manifest_hash
 
     # ---------- 生命周期 ----------
 
@@ -1158,10 +1237,10 @@ class ZipPayloadTool:
         self._payload_offset = entry["data_offset"]
         self._payload_size = entry["uncompressed_size"]
         try:
-            self._partitions_start, self._partitions, self._block_size = \
-                PayloadExtractor.parse_payload_header(
-                    self.fetcher, self._payload_offset, self.file_size
-                )
+            (self._partitions_start, self._partitions, self._block_size,
+             self._manifest_hash) = PayloadExtractor.parse_payload_header(
+                self.fetcher, self._payload_offset, self.file_size
+            )
         except Exception:
             return False
         # payload_metadata.bin 大小 = 24 字节固定头 + manifest + 元数据签名，
@@ -1185,6 +1264,33 @@ class ZipPayloadTool:
             "image_size": PayloadExtractor._image_size(p, self._block_size),
             "download_size": sum(op.data_length for op in p.operations),
         } for p in self._partitions]
+
+    def get_ota_info(self):
+        """读取并解析 META-INF/com/android/metadata，返回键值字典。
+
+        典型键：pre-device（设备代号）、post-build / post-build-incremental（版本）、
+        post-sdk-level（API 级别）、post-security-patch-level（安全补丁）、
+        post-timestamp（Unix 时间戳）、ota-type（AB/A）等；
+        无该文件或解析失败返回 None。ota-property-files 这类超长索引键会跳过。
+        """
+        try:
+            entry = self._locate_entry("META-INF/com/android/metadata")
+            if entry is None:
+                return None
+            text = self._read_entry_content(entry).decode("utf-8", "replace")
+        except Exception:
+            return None
+        info = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if "property-files" in key or key in info:
+                continue
+            info[key] = value.strip().strip('"').strip("'")
+        return info or None
 
     def extract_partition(self, name, output=None, on_written=None):
         """提取指定分区为镜像文件，成功返回 True。
