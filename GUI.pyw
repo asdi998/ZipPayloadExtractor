@@ -151,6 +151,11 @@ class ZipGUI:
         self.download_thread = None
         self._busy = False
 
+        # 下载队列：支持下载进行中追加新勾选的分区
+        self._pending = []          # 待下载分区名（FIFO）
+        self._pending_lock = threading.Lock()
+        self._new_item = threading.Event()
+
         self.log_lines = []         # 日志内容（「日志」按钮弹窗查看）
         self.log_window = None
 
@@ -355,8 +360,6 @@ class ZipGUI:
     # ================= 下载 =================
 
     def _start_download(self):
-        if self._busy:
-            return
         if self.tool is None or not self.partitions:
             messagebox.showwarning("提示", "请先获取分区信息")
             return
@@ -371,15 +374,43 @@ class ZipGUI:
             messagebox.showerror("错误", f"无法创建保存目录: {e}")
             return
         self.save_dir_var.set(save_dir)
+
+        # 新勾选的分区先进待处理队列
+        with self._pending_lock:
+            self._pending.extend(selected)
+        self._new_item.set()
+
+        if self._busy and self.download_thread is not None \
+                and self.download_thread.is_alive():
+            # 下载进行中：追加到当前队列，不打断进行中的任务
+            self.status_var.set(f"已加入队列 {len(selected)} 个分区")
+            self._log(f"已加入队列: {', '.join(selected)}")
+            return
+
+        # 新起下载队列
+        self._new_item.clear()
         self._set_busy(True, "下载中...")
         self.download_thread = threading.Thread(
-            target=self._download_worker, args=(selected, save_dir), daemon=True)
+            target=self._download_worker, args=(save_dir,), daemon=True)
         self.download_thread.start()
 
-    def _download_worker(self, names, save_dir):
+    def _pop_pending(self):
+        with self._pending_lock:
+            if self._pending:
+                return self._pending.pop(0)
+        return None
+
+    def _download_worker(self, save_dir):
         try:
-            for name in names:
+            while True:
                 if self.tool.stop_event.is_set():
+                    break
+                name = self._pop_pending()
+                if name is None:
+                    # 队列空：短暂等待可能的新增任务（下载中追加的分区会被接住）
+                    if self._new_item.wait(1.0):
+                        self._new_item.clear()
+                        continue
                     break
                 self.events.put(("download_start", name))
                 out = os.path.join(save_dir, name + ".img")
@@ -452,9 +483,18 @@ class ZipGUI:
             pass
 
     def _cancel(self):
-        if self.tool is not None:
-            self.tool.stop()
+        if self._busy and self.download_thread is not None \
+                and self.download_thread.is_alive():
+            # 有进行中的下载：优雅停止，队列结束后自动复位
+            if self.tool is not None:
+                self.tool.stop()
             self.status_var.set("正在取消...")
+            self._log("正在取消...")
+        else:
+            # 空闲时点取消：不改任何状态，否则会卡在“正在取消”且 stop 标志
+            # 残留导致下一次下载瞬间结束
+            self.status_var.set("当前没有进行中的下载")
+            self._log("点击取消：当前没有进行中的下载")
 
     def _on_close(self):
         if self.tool is not None:

@@ -7,12 +7,15 @@
 
 - 🌐 **远程与本地** —— 支持 `https://...` 链接（HTTP Range 请求）与本地文件，可处理数 GB 的大包
 - ⚡ **快速定位 payload.bin** —— 只发 1 次 64KB 请求即可定位，不再读取文件尾部的中央目录
-- 🚀 **并行提取** —— 「抓取-解压」流水线并行，连续数据合并成大块读取，网络与 CPU 同时跑满
+- 🚀 **并行提取** —— 「抓取-解压」流水线并行；组大小自适应：小分区自动切分保证多连接并行，
+  大分区保持大块请求；尾部组拆小 + 波次对齐，限速链接下不会"卡 99%"
 - 📊 **实时进度** —— 流式接收按 128KB 粒度上报，链接限速时进度条依然平滑推进
 - 🔁 **抗抖动 CDN** —— 请求级 + 组级 + 整次提取三级重试，中途断连自动续传
 - 🕳️ **ZERO 操作零成本** —— 零填充区域不下载也不写盘
 - 📄 **任意文件提取** —— `payload.bin`、`META-INF/com/android/metadata` 等 ZIP 条目均可提取
 - 📱 **OTA 信息展示** —— 设备代号、Android 版本、安全补丁级别、构建时间（GUI 直接可见）
+- ✅ **下载完整性** —— 逐操作 sha256 校验（manifest 内置哈希），损坏数据会被拦截并失败，
+  不会产出静默损坏的镜像
 
 ## 三种使用方式
 
@@ -20,7 +23,7 @@
 
 | 方式 | 适合谁 | 说明 |
 | --- | --- | --- |
-| 🖥️ **GUI**（图形界面） | 普通用户（Windows） | 输入链接或选择本地文件 → 查看 OTA 信息与分区列表 → 勾选分区一键下载，进度一目了然 |
+| 🖥️ **GUI**（图形界面） | 普通用户（Windows） | 输入链接或选择本地文件 → 查看 OTA 信息与分区列表 → 勾选分区一键下载，进度一目了然；下载中可继续勾选追加队列 |
 | ⌨️ **CLI**（命令行） | 脚本/服务器用户 | 一行命令提取指定分区或文件，`python ZipPayloadExtractor.py --help` 查看全部参数 |
 | 📦 **函数接口**（Python API） | 开发者 | 把提取能力集成进自己的程序 |
 
@@ -37,8 +40,9 @@
 2. 点击「获取分区」——自动显示设备/Android 版本/安全补丁等 OTA 信息与全部分区
 3. 勾选要下载的分区 → 点「开始下载」，进度条实时显示已下载/总大小
 
-> 下载过的分区再次勾选会自动跳过（已识别同一升级包，换包后自动重新下载）；
-> 取消下载不会残留半成品文件。
+> 下载过的分区再次勾选会自动跳过（通过包指纹识别同一升级包，换包后自动重新下载）；
+> 下载中勾选新分区点「开始下载」会追加到队列；取消下载不会残留半成品文件；
+> 链接限速时可调大线程数（默认 8）获得更多并行连接。
 
 ### 非 Windows 用户 / 开发者（Python 运行）
 
@@ -86,10 +90,11 @@ with zpe.ZipPayloadTool("https://example.com/update.zip", threads=16,
 | --- | --- | --- |
 | 定位 payload.bin | 读尾部 1MB 找中央目录，再下载数 MB 目录，再校验本地头 —— 3 次以上往返 | 扫描开头 64KB 本地文件头 —— **1 次往返**（不够时 64KB→4MB 指数扩容，失败回退中央目录） |
 | 列分区 | 每次调用重复同样的定位开销 | 每个 `ZipPayloadTool` 实例解析一次并缓存 |
-| 提取分区 | 每个操作一次 HTTP 请求、共享非线程安全 Session、下载→解压串行 | 连续操作合并成 8~32MB 大块读取（流式接收）；抓取与解压流水线并行；ZERO 操作完全跳过 |
+| 提取分区 | 每个操作一次 HTTP 请求、共享非线程安全 Session、下载→解压串行 | 连续操作合并成大块读取（流式接收、128KB 粒度计进度）；组大小自适应 + 尾部拆小 + 波次对齐；抓取与解压流水线并行；ZERO 操作完全跳过 |
 
 真实测试（小米 OTA 包，4.95 GB）：列分区仅 **0.37s**，`payload.bin` 位于偏移 4914；
-96MB 的 `boot` 分区约 6s 提取完成（普通网络下 15MB/s+）。
+96MB 的 `boot` 分区约 6s 提取完成（普通网络下 15MB/s+）。按连接限速的 CDN 上，
+小分区通过自适应分组保持多连接并行，尾部不再"卡 99%"。
 
 ## 自行打包 exe
 
@@ -98,7 +103,7 @@ with zpe.ZipPayloadTool("https://example.com/update.zip", threads=16,
 ```bash
 py -3.13 -m nuitka --onefile --assume-yes-for-downloads --output-dir=build-nuitka \
   --include-package-data=certifi --enable-plugin=tk-inter --windows-console-mode=disable \
-  --product-name=ZipPayloadExtractor --product-version=3.1.0 \
+  --product-name=ZipPayloadExtractor --product-version=3.2.0 \
   --output-filename=ZipPayloadExtractorGUI.exe GUI.pyw
 ```
 

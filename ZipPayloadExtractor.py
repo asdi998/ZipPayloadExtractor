@@ -89,12 +89,13 @@ HEADER_FIXED_SIZE = 24          # payload.bin 固定头大小（magic4+version8+
 CHUNK_SIZE = 1024 * 1024 * 4    # 普通文件分块下载的块大小（4MB）
 MAX_RETRIES = 6                 # 单次 Range 读取的应用层重试次数（CDN 断连场景）
 GROUP_READ_TRIES = 3            # 分区提取时一组数据的读取尝试次数（组级重试）
-DEFAULT_THREADS = 8
-__version__ = "3.1.0"
+DEFAULT_THREADS = 8             # 默认并发数（限速链接可调大，GUI/CLI 均可）
+__version__ = "3.2.0"
 HEAD_SCAN_STEPS = (64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)  # 快速定位扩容窗口
 HEAD_SCAN_MAX = 4 * 1024 * 1024
-GROUP_TARGET = 8 * 1024 * 1024  # 合并读取的目标大小（8MB）
+GROUP_TARGET = 8 * 1024 * 1024  # 合并读取的目标大小（8MB，大分区时保持大块）
 GROUP_CAP = 32 * 1024 * 1024    # 单次读取上限（32MB）
+MIN_GROUP_SIZE = 256 * 1024     # 自适应合并时的最小组大小（保证小分区也有并行）
 
 # 中央目录文件头（46 字节，含签名）
 _CD_STRUCT = struct.Struct("<4sHHHHHHIIIHHHHHII")
@@ -688,6 +689,38 @@ class PayloadExtractor:
         return start, end
 
     @staticmethod
+    def _split_tail_group(groups, piece):
+        """把最后一个过大的组按操作拆成不超过 piece 的小组。
+
+        目的：分区尾部剩余组少、并发低（限速 CDN 下表现为「卡 99%」），
+        拆小尾部组可大幅缩短低并发阶段。返回新组列表。
+        """
+        if not groups:
+            return groups
+        gstart, glen, items = groups[-1]
+        if glen <= piece:
+            return groups
+        head = groups[:-1]
+        pieces = []
+        cur_items = []
+        cur_start = None
+        cur_len = 0
+        for op, rel, length in items:
+            if cur_items and cur_len + length > piece:
+                pieces.append((cur_start, cur_len, cur_items))
+                cur_items = []
+                cur_len = 0
+                cur_start = None
+            if cur_start is None:
+                cur_start = gstart + rel
+            # 相对偏移重定位到新组起点
+            cur_items.append((op, rel - (cur_start - gstart), length))
+            cur_len += length
+        if cur_items:
+            pieces.append((cur_start, cur_len, cur_items))
+        return head + pieces
+
+    @staticmethod
     def extract_partition(fetcher, partition, output_path, base_offset, block_size,
                           threads, on_progress=None, on_written=None):
         """提取分区镜像。
@@ -761,12 +794,26 @@ class PayloadExtractor:
                 return True
 
             ops.sort(key=lambda op: op.data_offset)
-            groups = PayloadExtractor._build_groups(ops)
+            # 自适应组大小：总数据量小时按「总量÷线程数」切分，保证小分区
+            # 也有多组并行下载（CDN 常按连接限速，固定大块会让小分区退化成
+            # 单连接速度）；数据量大时保持 8MB 大块（请求少、顺序访问）。
+            # 若因操作粒度导致组数不足线程数，则逐次减半组目标，
+            # 保证每个抓取线程都有活干（否则尾部会以低并发爬行）。
+            n_fetchers = max(1, threads)
+            n_waves = max(1, math.ceil(total / (n_fetchers * GROUP_TARGET)))
+            group_target = max(MIN_GROUP_SIZE,
+                               math.ceil(total / (n_waves * n_fetchers)))
+            groups = PayloadExtractor._build_groups(ops, target=group_target)
+            while len(groups) < n_fetchers and group_target > MIN_GROUP_SIZE:
+                group_target = max(MIN_GROUP_SIZE, group_target // 2)
+                groups = PayloadExtractor._build_groups(ops, target=group_target)
+            # 尾部大组拆小：低并发阶段最多只剩 组目标÷线程数 的字节
+            groups = PayloadExtractor._split_tail_group(
+                groups, max(MIN_GROUP_SIZE, group_target // n_fetchers))
             work = queue.Queue(maxsize=max(2, threads * 2))
             gindex = itertools.count()
             gindex_lock = threading.Lock()
             write_lock = threading.Lock()
-            n_fetchers = max(1, threads)
             n_processors = max(1, threads)
 
             def fetcher_worker():
@@ -1306,11 +1353,16 @@ class ZipPayloadTool:
             available = ", ".join(p.partition_name for p in self._partitions)
             raise PartitionNotFoundError(f"未找到分区 '{name}'，可用分区: {available}")
         try:
-            return PayloadExtractor.extract_partition(
+            ok = PayloadExtractor.extract_partition(
                 self.fetcher, target, output,
                 self._payload_offset + self._partitions_start,
                 self._block_size, self.threads, self.on_progress, on_written,
             )
+            if not ok:
+                # 失败（网络/校验/中断）时清理半成品，避免留下看似完整
+                # 实则残缺的镜像（半成品经 truncate 后大小与完整镜像相同）
+                self._remove_partial(output)
+            return ok
         except DownloadInterrupted:
             self._remove_partial(output)
             return False
