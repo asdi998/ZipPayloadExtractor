@@ -1,3 +1,4 @@
 requests>=2.25
 protobuf>=5.27.2
 zstandard>=0.21
+brotli>=1.1

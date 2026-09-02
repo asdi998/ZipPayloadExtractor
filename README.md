@@ -6,7 +6,9 @@
 ## 特性
 
 - 🌐 **远程与本地** —— 支持 `https://...` 链接（HTTP Range 请求）与本地文件，可处理数 GB 的大包
-- ⚡ **快速定位 payload.bin** —— 只发 1 次 64KB 请求即可定位，不再读取文件尾部的中央目录
+- ⚡ **快速定位 payload.bin** —— 只发 1 次 8KB 请求即可定位（metadata 索引优先，
+  本地头扫描兜底），不再读取文件尾部的中央目录；manifest 精确长度读取，
+  一次「获取分区」仅 2 个请求、约 310KB
 - 🚀 **并行提取** —— 「抓取-解压」流水线并行；组大小自适应：小分区自动切分保证多连接并行，
   大分区保持大块请求；尾部组拆小 + 波次对齐，限速链接下不会"卡 99%"
 - 📊 **实时进度** —— 流式接收按 128KB 粒度上报，链接限速时进度条依然平滑推进
@@ -16,6 +18,9 @@
 - 📱 **OTA 信息展示** —— 设备代号、Android 版本、安全补丁级别、构建时间（GUI 直接可见）
 - ✅ **下载完整性** —— 逐操作 sha256 校验（manifest 内置哈希），损坏数据会被拦截并失败，
   不会产出静默损坏的镜像
+- 🗂️ **多代包兼容** —— A/B payload 包（Android 7+）走最优路径；旧式 recovery 包自动兼容：
+  zip 镜像文件（boot.img 等）直接提取，`system.new.dat(.br)+transfer.list` 全量分区
+  （Android 8-10 时代）brotli 解压重建，两种 transfer list 格式均支持
 
 ## 三种使用方式
 
@@ -46,7 +51,7 @@
 
 ### 非 Windows 用户 / 开发者（Python 运行）
 
-要求 Python 3.8+：
+要求 Python 3.8+（旧式 `.dat.br` 分区需 `brotli`，已含在 requirements）：
 
 ```bash
 pip install -r requirements.txt
@@ -96,6 +101,15 @@ with zpe.ZipPayloadTool("https://example.com/update.zip", threads=16,
 96MB 的 `boot` 分区约 6s 提取完成（普通网络下 15MB/s+）。按连接限速的 CDN 上，
 小分区通过自适应分组保持多连接并行，尾部不再"卡 99%"。
 
+### 兼容代际
+
+| 包类型 | 时代 | 处理方式 |
+| --- | --- | --- |
+| A/B payload（`payload.bin`） | Android 7+ / 现行 | 最优路径：2 个请求完成列分区，流水线并行提取 |
+| recovery 镜像包（`*.img`） | 各代 | zip 根目录与 `firmware-update/` 镜像直接提取 |
+| recovery 数据包（`X.new.dat.br`+`transfer.list`） | Android 8-10 | brotli 流式解压 + 区间重放重建（需 brotli；增量包不支持） |
+| 更早（`system.new.dat` 非 br） | Android <8 | 同一逻辑，无需 brotli |
+
 ## 自行打包 exe
 
 需要打包成 Windows 单文件 exe 时（GUI 版示例）：
@@ -103,7 +117,7 @@ with zpe.ZipPayloadTool("https://example.com/update.zip", threads=16,
 ```bash
 py -3.13 -m nuitka --onefile --assume-yes-for-downloads --output-dir=build-nuitka \
   --include-package-data=certifi --enable-plugin=tk-inter --windows-console-mode=disable \
-  --product-name=ZipPayloadExtractor --product-version=3.2.0 \
+  --product-name=ZipPayloadExtractor --product-version=3.3.0 \
   --output-filename=ZipPayloadExtractorGUI.exe GUI.pyw
 ```
 

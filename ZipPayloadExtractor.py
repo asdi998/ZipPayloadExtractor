@@ -12,15 +12,17 @@ ZipPayloadExtractor —— 从 Android OTA ZIP 包（payload.bin）中快速提�
   4. ZipUtils       —— ZIP 结构解析：开头本地头快速定位（主）+ 中央目录（兜底）
   5. PayloadExtractor —— payload.bin 清单解析 + 分区提取引擎（两阶段流水线）
   6. FileExtractor  —— ZIP 内普通文件提取（并行分块下载）
-  7. ZipPayloadTool —— 高层工具类（库 API 主入口，全部状态在实例内）
-  8. 模块级便捷函数  —— list_partitions / extract_partition / extract_file
-  9. CLI            —— 仅当以脚本方式运行时生效
+  7. LegacyPartitions —— 旧式 recovery OTA（X.new.dat(.br)+transfer.list）分区重建
+  8. ZipPayloadTool —— 高层工具类（库 API 主入口，全部状态在实例内）
+  9. 模块级便捷函数  —— list_partitions / extract_partition / extract_file
+  10. CLI            —— 仅当以脚本方式运行时生效
 
 性能优化要点：
   * 定位 payload.bin 不再读文件尾部的中央目录：OTA 包中 payload.bin 的本地文件头
-    位于 ZIP 开头几十 KB 内（例如数据偏移 4966、头部在 ~4930），只请求开头 64KB
+    位于 ZIP 开头几 KB 内（例如数据偏移 4966、头部在 ~4930），只请求开头 8KB
     顺序扫描本地文件头即可拿到数据偏移与压缩大小，1 次 HTTP 往返；窗口按
-    64KB→256KB→1MB→4MB 指数扩容兜底，失败再回退中央目录法。
+    8KB→64KB→…→4MB 指数扩容兜底，失败再回退中央目录法。
+    头部缓冲在工具实例内共享：metadata 定位与内容直接复用同一缓冲，零额外请求。
   * payload_metadata.bin 是虚拟条目（无独立 ZIP 条目），与 payload.bin 同偏移，
     即其前缀（24 字节固定头 + manifest + 元数据签名），工具解析清单时已在读取；
     其索引（META-INF/com/android/metadata 的 ota-property-files，记录
@@ -34,8 +36,11 @@ ZipPayloadExtractor —— 从 Android OTA ZIP 包（payload.bin）中快速提�
     整次提取失败自动重试；单组失败不再导致整个分区前功尽弃。
   * 大块读取采用流式接收（128KB 粒度增量计进度）：合并请求的数量优势不变，
     但链接限速时进度条仍平滑推进，不再"一组不读完进度不动"。
-  * 修复：多 dst_extents 写入、压缩方法/未压缩大小的字段索引、ZIP64 本地头尺寸、
-    每块下载重复开关输出文件等原有问题。
+  * 兼容旧式 recovery OTA（无 payload.bin）：zip 镜像文件（*.img）直接列出提取；
+    X.new.dat(.br)+transfer.list 全量分区经 brotli 流式解压 + 区间重放重建，
+    小米逗号格式与 AOSP 短横线格式均可（需 brotli 库）。
+  * 修复：多 dst_extents 写入、压缩方法/未压缩大小的字段索引、ZIP64 条件解析
+    （仅溢出字段写入扩展记录）、每块下载重复开关输出文件等原有问题。
 """
 
 import argparse
@@ -60,6 +65,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import zstandard
+
+try:
+    import brotli as _brotli  # 旧式 recovery OTA 的 .dat.br 分区需要
+except ImportError:
+    _brotli = None
 
 import update_metadata_pb2 as um
 
@@ -90,8 +100,8 @@ CHUNK_SIZE = 1024 * 1024 * 4    # 普通文件分块下载的块大小（4MB）
 MAX_RETRIES = 6                 # 单次 Range 读取的应用层重试次数（CDN 断连场景）
 GROUP_READ_TRIES = 3            # 分区提取时一组数据的读取尝试次数（组级重试）
 DEFAULT_THREADS = 8             # 默认并发数（限速链接可调大，GUI/CLI 均可）
-__version__ = "3.2.0"
-HEAD_SCAN_STEPS = (64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)  # 快速定位扩容窗口
+__version__ = "3.3.0"
+HEAD_SCAN_STEPS = (8 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)  # 快速定位扩容窗口（8KB 起步）
 HEAD_SCAN_MAX = 4 * 1024 * 1024
 GROUP_TARGET = 8 * 1024 * 1024  # 合并读取的目标大小（8MB，大分区时保持大块）
 GROUP_CAP = 32 * 1024 * 1024    # 单次读取上限（32MB）
@@ -302,12 +312,119 @@ class DataFetcher:
                     time.sleep(0.3 * (2 ** attempt))
         raise IOError(f"读取远程数据失败 [{start}-{end}]: {last_error}")
 
+    def read_head_with_size(self, length=8192):
+        """读取开头 length 字节，同时从响应头取得文件总大小。
+
+        206 响应的 Content-Range 携带总大小（RFC 要求），因此一个请求
+        同时完成「取大小 + 取头部数据」，无需单独的 HEAD 请求。
+        返回 (data, total_size)；服务器忽略 Range 时只取前 length 字节。
+        """
+        if not self.remote:
+            data = self._read_local(0, length - 1)
+            return data, os.path.getsize(self.source)
+        headers = {"Range": f"bytes=0-{length - 1}"}
+        r = self._session().get(self.source, headers=headers,
+                                timeout=(5, 60), stream=True)
+        try:
+            if r.status_code == 206:
+                cr = r.headers.get("Content-Range", "")
+                total = int(cr.rsplit("/", 1)[1]) if "/" in cr else None
+                if total is None or total <= 0:
+                    raise IOError("服务器未返回 Content-Range 头")
+                chunks = []
+                got = 0
+                for chunk in r.iter_content(chunk_size=128 * 1024):
+                    if self.stop_event.is_set():
+                        raise DownloadInterrupted("操作已被中断")
+                    if chunk:
+                        chunks.append(chunk)
+                        got += len(chunk)
+                        if got >= length:
+                            break
+                r.close()
+                return b"".join(chunks), total
+            if r.status_code == 200:
+                # 服务器忽略 Range：只读取前 length 字节
+                total = r.headers.get("Content-Length")
+                chunks = []
+                got = 0
+                for chunk in r.iter_content(chunk_size=128 * 1024):
+                    if chunk:
+                        chunks.append(chunk)
+                        got += len(chunk)
+                        if got >= length:
+                            break
+                r.close()
+                if total is None:
+                    raise IOError("服务器未返回 Content-Length 头")
+                return b"".join(chunks), int(total)
+            r.raise_for_status()
+            raise IOError(f"HTTP {r.status_code}")
+        except requests.exceptions.RequestException as e:
+            if self.stop_event.is_set():
+                raise DownloadInterrupted("操作已被中断") from e
+            raise IOError(f"读取远程文件头失败: {e}") from e
+
     def _read_local(self, start, end=None):
         if self._mmap is not None:
             return self._mmap[start:] if end is None else self._mmap[start:end + 1]
         with open(self.source, "rb") as f:
             f.seek(start)
             return f.read() if end is None else f.read(end - start + 1)
+
+    def iter_range(self, start, end):
+        """流式迭代 [start, end]（含）的字节块（128KB 粒度，惰性生成）。
+
+        用于超大文件的顺序处理（如旧式 recovery OTA 的 .dat.br，可达数 GB），
+        内存占用有界；远程连接中途断开时自动从已收位置续传重试，数据不重不漏。
+        """
+        if not self.remote:
+            data = self._read_local(start, end)
+            if data:
+                yield data
+            return
+        pos = start
+        expected = end - start + 1
+        received = 0
+        while pos <= end:
+            ok = False
+            last_error = None
+            for attempt in range(self.max_retries + 1):
+                if self.stop_event.is_set():
+                    raise DownloadInterrupted("操作已被中断")
+                try:
+                    headers = {"Range": f"bytes={pos}-{end}"}
+                    r = self._session().get(self.source, headers=headers,
+                                            timeout=(5, 60), stream=True)
+                    cl = r.headers.get("Content-Length")
+                    if r.status_code == 200 and cl is not None \
+                            and int(cl) != (end - pos + 1):
+                        r.close()
+                        raise IOError("服务器未正确响应 Range 请求")
+                    r.raise_for_status()
+                    for chunk in r.iter_content(chunk_size=128 * 1024):
+                        if self.stop_event.is_set():
+                            r.close()
+                            raise DownloadInterrupted("操作已被中断")
+                        if chunk:
+                            pos += len(chunk)
+                            received += len(chunk)
+                            yield chunk
+                    r.close()
+                    ok = True
+                    break
+                except DownloadInterrupted:
+                    raise
+                except requests.exceptions.RequestException as e:
+                    if self.stop_event.is_set():
+                        raise DownloadInterrupted("操作已被中断") from e
+                    last_error = e
+                    if attempt < self.max_retries:
+                        time.sleep(0.3 * (2 ** attempt))
+            if not ok:
+                raise IOError(f"读取远程数据失败 [{start}-{end}]: {last_error}")
+            if received >= expected:
+                break
 
     def _read_remote(self, start, end=None):
         """带应用层重试的 Range 读取（CDN 中途断连等场景，重试同一幂等范围请求）。"""
@@ -373,8 +490,16 @@ class ZipUtils:
     """ZIP 结构解析：快速定位（开头本地头扫描）+ 兜底（尾部中央目录）。"""
 
     @staticmethod
-    def parse_zip64_extra(extra_field):
-        """解析 ZIP64 扩展字段（ID 0x0001），返回可能含 uncomp_size/compressed_size/local_header_offset 的字典"""
+    def parse_zip64_extra(extra_field, need_uncomp=False, need_comp=False,
+                          need_offset=False):
+        """按需解析 ZIP64 扩展字段（ID 0x0001）。
+
+        ZIP 规范：只有 32 位值为 0xFFFFFFFF（溢出）的字段才会写入扩展记录，
+        且按固定顺序（uncomp_size → compressed_size → local_header_offset）
+        排列，缺失的字段不占位。因此必须按「哪些字段溢出」条件消费，
+        否则会把 offset 错读成 size（真实包如小米旧版 recovery 包只写
+        溢出的 offset 一个字段）。
+        """
         values = {}
         pos = 0
         while pos <= len(extra_field) - 4:
@@ -382,14 +507,14 @@ class ZipUtils:
             if header_id == 0x0001:
                 data = extra_field[pos + 4:pos + 4 + size]
                 ptr = 0
-                if size >= 8:
-                    values["uncomp_size"] = struct.unpack("<Q", data[ptr:ptr + 8])[0]
-                    ptr += 8
-                if size >= 16:
-                    values["compressed_size"] = struct.unpack("<Q", data[ptr:ptr + 8])[0]
-                    ptr += 8
-                if size >= 24:
-                    values["local_header_offset"] = struct.unpack("<Q", data[ptr:ptr + 8])[0]
+                for key, need in (("uncomp_size", need_uncomp),
+                                  ("compressed_size", need_comp),
+                                  ("local_header_offset", need_offset)):
+                    if need:
+                        if ptr + 8 > len(data):
+                            break
+                        values[key] = struct.unpack("<Q", data[ptr:ptr + 8])[0]
+                        ptr += 8
                 break
             pos += 4 + size
         return values
@@ -397,60 +522,54 @@ class ZipUtils:
     # ---------- 快速路径：扫描 ZIP 开头的本地文件头 ----------
 
     @staticmethod
-    def find_entry_in_head(fetcher, file_size, target,
-                           steps=HEAD_SCAN_STEPS, max_total=HEAD_SCAN_MAX):
-        """只读 ZIP 开头若干字节，顺序扫描本地文件头定位目标文件。
+    def scan_head_segment(data, target, pos=0):
+        """在已下载的 ZIP 开头数据中从 pos 起顺序扫描本地文件头查找目标。
 
-        命中返回条目 dict（data_offset 已直接可用，无需再校验本地头）；
-        遇到数据描述符（flag bit 3，本地头尺寸不可信）、窗口耗尽未命中
-        等情况返回 None，由调用方回退中央目录法。
-        读取成本：通常 1 次 64KB 请求；窗口按 steps 指数扩容，最多 max_total。
+        返回 (entry, pos, status)：
+          entry  — 命中时为条目 dict（data_offset 直接可用）
+          pos    — 扫描停止位置（扩容后可从该位置继续）
+          status — 'hit' 命中 / 'need_more' 头部被窗口截断，需更多数据 /
+                   'abort' 数据描述符/ZIP64 异常，不可继续（回退中央目录）/
+                   'done' 窗口内扫描完毕未命中
         """
-        data = b""
-        pos = 0
-        for step in steps:
-            end = min(len(data) + step, file_size)
-            if end > len(data):
-                data += fetcher.read(len(data), end - 1)
-            while pos + 30 <= len(data):
-                if fetcher.stop_event.is_set():
-                    return None
-                if data[pos:pos + 4] != ZIP_HEADERS['LOCAL']:
-                    pos += 1
-                    continue
-                (_, _, flag, method, _, _, _, csize, ucsize, nlen, elen) = \
-                    _LH_STRUCT.unpack_from(data, pos)
-                if pos + 30 + nlen > len(data):
-                    break  # 文件名被窗口截断 → 扩大窗口后从同一位置继续
-                name = data[pos + 30:pos + 30 + nlen].decode("utf-8", "replace")
-                if flag & 0x08:
-                    return None  # 数据描述符：本地头中的尺寸不可信
-                if pos + 30 + nlen + elen > len(data):
-                    break  # 扩展字段被窗口截断 → 扩大窗口
-                real_csize, real_ucsize = csize, ucsize
-                if csize == 0xFFFFFFFF or ucsize == 0xFFFFFFFF:
-                    extra = data[pos + 30 + nlen:pos + 30 + nlen + elen]
-                    zv = ZipUtils.parse_zip64_extra(extra)
-                    real_csize = zv.get("compressed_size", csize)
-                    real_ucsize = zv.get("uncomp_size", ucsize)
-                    if real_csize == 0xFFFFFFFF or real_ucsize == 0xFFFFFFFF:
-                        return None
-                if name == target:
-                    return {
-                        "name": name,
-                        "method": method,
-                        "flag": flag,
-                        "compressed_size": real_csize,
-                        "uncompressed_size": real_ucsize,
-                        "local_offset": pos,
-                        "data_offset": pos + 30 + nlen + elen,
-                    }
-                # 跳到下一个本地文件头（跳过本文件的数据体，payload.bin 的
-                # 8GB 数据因此只消耗一次加法运算，不会逐字节扫描）
-                pos += 30 + nlen + elen + real_csize
-            if len(data) >= file_size:
-                break
-        return None
+        n = len(data)
+        while pos + 30 <= n:
+            if data[pos:pos + 4] != ZIP_HEADERS['LOCAL']:
+                pos += 1
+                continue
+            (_, _, flag, method, _, _, _, csize, ucsize, nlen, elen) = \
+                _LH_STRUCT.unpack_from(data, pos)
+            if pos + 30 + nlen > n:
+                return None, pos, 'need_more'  # 文件名被窗口截断
+            name = data[pos + 30:pos + 30 + nlen].decode("utf-8", "replace")
+            if flag & 0x08:
+                return None, pos, 'abort'  # 数据描述符：本地头中的尺寸不可信
+            if pos + 30 + nlen + elen > n:
+                return None, pos, 'need_more'  # 扩展字段被窗口截断
+            real_csize, real_ucsize = csize, ucsize
+            if csize == 0xFFFFFFFF or ucsize == 0xFFFFFFFF:
+                extra = data[pos + 30 + nlen:pos + 30 + nlen + elen]
+                zv = ZipUtils.parse_zip64_extra(
+                    extra, need_uncomp=ucsize == 0xFFFFFFFF,
+                    need_comp=csize == 0xFFFFFFFF)
+                real_csize = zv.get("compressed_size", csize)
+                real_ucsize = zv.get("uncomp_size", ucsize)
+                if real_csize == 0xFFFFFFFF or real_ucsize == 0xFFFFFFFF:
+                    return None, pos, 'abort'
+            if name == target:
+                return {
+                    "name": name,
+                    "method": method,
+                    "flag": flag,
+                    "compressed_size": real_csize,
+                    "uncompressed_size": real_ucsize,
+                    "local_offset": pos,
+                    "data_offset": pos + 30 + nlen + elen,
+                }, pos, 'hit'
+            # 跳到下一个本地文件头（跳过本文件的数据体，payload.bin 的
+            # 8GB 数据因此只消耗一次加法运算，不会逐字节扫描）
+            pos += 30 + nlen + elen + real_csize
+        return None, pos, 'done'
 
     # ---------- 兜底路径：尾部中央目录 ----------
 
@@ -493,7 +612,12 @@ class ZipUtils:
             name_len, extra_len, comment_len = h[10], h[11], h[12]
             name = cd_data[pos + 46:pos + 46 + name_len].decode("utf-8", "replace")
             extra = cd_data[pos + 46 + name_len:pos + 46 + name_len + extra_len]
-            zv = ZipUtils.parse_zip64_extra(extra)
+            zv = ZipUtils.parse_zip64_extra(
+                extra,
+                need_uncomp=h[9] == 0xFFFFFFFF,
+                need_comp=h[8] == 0xFFFFFFFF,
+                need_offset=h[16] == 0xFFFFFFFF,
+            )
             entries.append({
                 "name": name,
                 "method": h[4],
@@ -569,15 +693,18 @@ class PayloadExtractor:
     """payload.bin（ChromeOS update_engine 格式）清单解析与分区提取引擎。"""
 
     @staticmethod
-    def parse_payload_header(fetcher, payload_offset, file_size):
+    def parse_payload_header(fetcher, payload_offset, file_size, read_cap=None):
         """解析 payload.bin 头部。
 
+        read_cap：manifest 区域精确长度（metadata 的 payload_metadata.bin 大小，
+        即 24 字节固定头 + manifest + 元数据签名），按需只读这么多字节，
+        避免固定 512KB 的多余下载；缺省时回退 512KB。
         返回 (数据起始偏移, 分区列表, block_size, manifest 指纹)；
         manifest 指纹为清单字节的 sha256，可唯一标识该 OTA 包
         （换链接重下同包指纹不变，换包必变）。
         """
-        end = min(payload_offset + 512 * 1024 - 1, file_size - 1)
-        header = fetcher.read(payload_offset, end)
+        read_len = min(read_cap or (512 * 1024), file_size - payload_offset)
+        header = fetcher.read(payload_offset, payload_offset + read_len - 1)
         if len(header) < HEADER_FIXED_SIZE or header[:4] != b"CrAU":
             raise ValueError("无效的payload.bin格式")
 
@@ -1055,7 +1182,187 @@ class FileExtractor:
 
 
 # =====================================================================
-# 7. 高层工具类 ZipPayloadTool（库 API 主入口）
+# 7. 旧式 recovery OTA 分区重建（LegacyPartitions）
+#    适用 Android <10 的 system.new.dat(.br) + system.transfer.list 全量包
+# =====================================================================
+
+LEGACY_BLOCK = 4096  # transfer list 的块大小固定为 4096
+
+
+class LegacyPartitions:
+    """旧式 recovery OTA（X.new.dat / X.new.dat.br + X.transfer.list）支持。
+
+    仅支持全量包（命令为 new/zero/erase，patch.dat 为空）；
+    增量包（含 diff/move/stash 命令）需旧镜像，抛错明确提示。
+    """
+
+    @staticmethod
+    def parse_transfer_list(text):
+        """解析 transfer list，兼容小米逗号格式与 AOSP 短横线格式。
+
+        返回 (镜像块数, [(类型, [(起块, 止块), ...]), ...]，块区间为止开区间)。
+        类型 ∈ {new, zero, erase}；出现其它命令抛 LegacyDatError。
+        """
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        header_blocks = 0
+        commands = []
+        for idx, line in enumerate(lines):
+            if idx == 0:
+                continue  # 版本号
+            if not line or line[0].isdigit():
+                # 纯数字行：小米格式为「总块数,0,0」；AOSP 格式为「命令条数」
+                try:
+                    header_blocks = max(header_blocks, int(line.split()[0]))
+                except ValueError:
+                    pass
+                continue
+            word = line.split(None, 1)[0]
+            cmd_type = word.lower()
+            if cmd_type not in ("new", "zero", "erase"):
+                raise ValueError(
+                    f"transfer list 含增量命令 '{cmd_type}'（需要旧镜像），"
+                    f"仅支持全量包")
+            # 拆 token：小米逗号格式（'new 4,0,471,...'）或 AOSP 空格格式
+            # （'new 4 0-471 ...'），统一先把空白归一为逗号
+            tokens = [t for t in line.replace(" ", ",").split(",") if t]
+            try:
+                count = int(tokens[1])
+                raw_values = tokens[2:]
+            except (IndexError, ValueError):
+                raise ValueError(f"无法解析 transfer list 行: {line[:80]}")
+            if count != len(raw_values):
+                raise ValueError(f"transfer list 行数值个数不符: {line[:80]}")
+            if any("-" in v for v in raw_values):
+                # AOSP 风格：每个 token 即一个 'start-end' 区间
+                ranges = []
+                for v in raw_values:
+                    s, e = v.split("-", 1)
+                    ranges.append((int(s), int(e)))
+            else:
+                # 小米风格：数值两两成对 (起块, 止块)
+                if count % 2 != 0:
+                    raise ValueError(f"transfer list 行区间数不符: {line[:80]}")
+                values = [int(v) for v in raw_values]
+                ranges = [(values[i], values[i + 1])
+                          for i in range(0, count, 2)]
+            commands.append((cmd_type, ranges))
+        # 镜像块数：头部数字行（小米=总块数）与区间最大止块的较大者
+        # （AOSP 头部是命令条数，此时区间止块为准）
+        max_block = max((e for _, ranges in commands for _, e in ranges),
+                        default=0)
+        return max(header_blocks, max_block), commands
+
+    @staticmethod
+    def total_new_blocks(commands):
+        return sum(e - s for cmd, ranges in commands if cmd == "new"
+                   for s, e in ranges)
+
+    @staticmethod
+    def extract(fetcher, data_entry, list_text, output_path, on_progress=None):
+        """下载 X.new.dat(.br) 并重建分区镜像。返回 True。
+
+        data_entry：zip 中 .new.dat / .new.dat.br 条目的 CD 信息；
+        数据流按 transfer list 中 new 区间的顺序解压并写盘，
+        最终字节数与区间总长严格比对（不一致即解析/传输错误）。
+        """
+        stop = fetcher.stop_event
+        header_blocks, commands = LegacyPartitions.parse_transfer_list(list_text)
+        segments = [(s * LEGACY_BLOCK, e * LEGACY_BLOCK)
+                    for cmd, ranges in commands if cmd == "new"
+                    for s, e in ranges]
+        if not segments:
+            raise ValueError("transfer list 中没有 new 命令")
+        max_block = max(e for cmd, ranges in commands for s, e in ranges)
+        image_size = max(header_blocks, max_block) * LEGACY_BLOCK
+        data_size = data_entry["compressed_size"]
+        name = data_entry["name"]
+        is_br = name.lower().endswith(".br")
+        if is_br and _brotli is None:
+            raise ValueError("需要 brotli 库支持 .dat.br 分区：pip install brotli")
+        if data_entry["method"] != 0:
+            raise ValueError(f"{name} 的 zip 压缩方法为 "
+                             f"{COMPRESSION_METHODS.get(data_entry['method'], ('未知',))[0]}，"
+                             f"旧式分区要求 ZIP_STORED")
+
+        decompressor = _brotli.Decompressor() if is_br else None
+        start_time = time.time()
+        total_download = data_size
+        downloaded = 0
+
+        def progress_cb(n):
+            nonlocal downloaded
+            downloaded += n
+            if on_progress:
+                try:
+                    on_progress(downloaded, total_download,
+                                ProgressUtils.speed_from_history(
+                                    [(time.time(), downloaded)]),
+                                time.time() - start_time)
+                except Exception:
+                    pass
+
+        with open(output_path, "w+b") as out:
+            out.truncate(image_size)
+            seg_idx = 0
+            seg_pos = segments[0][0] if segments else None
+            buf = b""
+            for chunk in fetcher.iter_range(
+                    data_entry["data_offset"],
+                    data_entry["data_offset"] + data_size - 1):
+                progress_cb(len(chunk))
+                if stop.is_set():
+                    raise DownloadInterrupted("操作已被中断")
+                if decompressor is not None:
+                    buf += decompressor.process(chunk)
+                else:
+                    buf += chunk
+                while buf and seg_idx < len(segments):
+                    s, e = segments[seg_idx]
+                    take = min(len(buf), e - seg_pos)
+                    out.seek(seg_pos)
+                    out.write(buf[:take])
+                    buf = buf[take:]
+                    seg_pos += take
+                    if seg_pos >= e:
+                        seg_idx += 1
+                        if seg_idx < len(segments):
+                            seg_pos = segments[seg_idx][0]
+                if seg_idx >= len(segments) and buf and not stop.is_set():
+                    raise ValueError("数据长度超过 transfer list 声明")
+            if decompressor is not None and not decompressor.is_finished():
+                # 还有缓冲输出或输入被截断：再取一次输出并校验
+                tail = decompressor.process(b"")
+                if tail:
+                    buf = tail + buf
+                    while buf and seg_idx < len(segments):
+                        s, e = segments[seg_idx]
+                        take = min(len(buf), e - seg_pos)
+                        out.seek(seg_pos)
+                        out.write(buf[:take])
+                        buf = buf[take:]
+                        seg_pos += take
+                        if seg_pos >= e:
+                            seg_idx += 1
+                            if seg_idx < len(segments):
+                                seg_pos = segments[seg_idx][0]
+                if not decompressor.is_finished():
+                    raise ValueError("brotli 流未完整结束（数据被截断？）")
+                if buf:
+                    raise ValueError("数据长度超过 transfer list 声明")
+            if seg_idx != len(segments):
+                raise ValueError(
+                    "数据长度不足 transfer list 声明（镜像或解析不匹配）")
+        if on_progress:
+            try:
+                on_progress(total_download, total_download, 0,
+                            time.time() - start_time)
+            except Exception:
+                pass
+        return True
+
+
+# =====================================================================
+# 8. 高层工具类 ZipPayloadTool（库 API 主入口）
 # =====================================================================
 
 class ZipPayloadTool:
@@ -1084,7 +1391,9 @@ class ZipPayloadTool:
         self._cd_offset = None
         self._cd_size = None
         self._cd_entries = None
-        self._head_entries = {}
+        self._head_entries = {}     # 头部快速定位缓存: 名称 -> 条目
+        self._head_data = b""       # 共享头部缓冲（8KB 起步扩容，跨目标复用，
+                                    # payload.bin 与 metadata 定位只取一次头部数据）
         self._payload_offset = None
         self._payload_size = None
         self._partitions_start = None
@@ -1093,6 +1402,7 @@ class ZipPayloadTool:
         self.payload_metadata_size = None  # 来自 ota-property-files 的 payload_metadata.bin 大小
         self.metadata_warning = None       # 定位结果与索引不一致时的警告文本
         self._manifest_hash = None         # payload manifest 指纹（包唯一标识）
+        self._cd_fingerprint = None        # 中央目录指纹（兼容模式包的标识）
 
     # ---------- payload 内部信息（只读） ----------
     # 供需要操作级访问的调用方（如 web 服务的内核版本提取）使用，
@@ -1120,18 +1430,32 @@ class ZipPayloadTool:
 
     @property
     def package_id(self):
-        """当前包的唯一指纹（payload manifest 的 sha256）。
+        """当前包的唯一指纹。
 
+        A/B 包：payload manifest 的 sha256；
+        兼容模式（无 payload.bin 的 recovery 包）：中央目录的 sha256。
         换链接重下同一个包指纹不变；换包（哪怕分区大小相同）指纹必变，
         可用于区分本地已下载文件是否属于当前包。调用 list_partitions() 后可用。
         """
-        return self._manifest_hash
+        return self._manifest_hash or self._cd_fingerprint
 
     # ---------- 生命周期 ----------
 
     def load(self):
-        """获取源文件总大小（所有操作前自动调用，也可手动调用检查源是否可用）。"""
-        if self.file_size is None:
+        """源可用性检查与初始化（所有操作前自动调用，也可手动调用）。
+
+        远程源：1 次「开头 8KB」请求 —— 响应头携带文件总大小
+        （206 Content-Range），头部数据同时作为共享头部缓冲，
+        之后定位 metadata/payload.bin 零额外请求。本地源：取文件大小。
+        """
+        if self.file_size is not None:
+            return True
+        if self.fetcher.remote:
+            data, size = self.fetcher.read_head_with_size(HEAD_SCAN_STEPS[0])
+            self.file_size = size
+            if not self._head_data:
+                self._head_data = data
+        else:
             self.file_size = self.fetcher.file_size()
         return True
 
@@ -1150,20 +1474,43 @@ class ZipPayloadTool:
 
     # ---------- 条目定位 ----------
 
+    # 权威确认无 payload.bin 的哨兵：metadata 的 ota-property-files 存在
+    # 但未登记 payload.bin（旧式 recovery/BLOCK 包），可直接短路，
+    # 避免徒劳的 4MB 头部扩容与中央目录读取
+    _PAYLOAD_ABSENT = object()
+
     def _locate_entry(self, name):
-        """定位文件条目：先走开头本地头快速扫描，再走 ota-property-files
-        索引（仅 payload.bin），最后回退中央目录。"""
+        """定位文件条目：payload.bin 先走 ota-property-files 索引（头部缓冲内的
+        metadata，零额外请求），其余文件走本地头扫描；都不中再回退中央目录。"""
         if name in self._head_entries:
             return self._head_entries[name]
         self.load()
-        try:
-            entry = ZipUtils.find_entry_in_head(self.fetcher, self.file_size, name)
-        except DownloadInterrupted:
-            raise
-        except Exception:
-            entry = None
-        if entry is None and name == "payload.bin":
-            entry = self._locate_payload_via_metadata()
+        entry = None
+        if name == "payload.bin":
+            # metadata 的 ota-property-files 直接给出 payload.bin 纯数据偏移与
+            # payload_metadata.bin 大小（manifest 区域精确长度）
+            found = self._locate_payload_via_metadata()
+            if found is ZipPayloadTool._PAYLOAD_ABSENT:
+                # 索引权威确认无 payload.bin：仅做缓冲内 + 一次 64KB 的
+                # 防御性扫描（防非常规打包遗漏登记），然后直接判定不存在
+                try:
+                    entry = self._locate_in_head(name, grow_steps=2)
+                except DownloadInterrupted:
+                    raise
+                except Exception:
+                    entry = None
+                if entry is not None:
+                    self._head_entries[name] = entry
+                    return entry
+                return None
+            entry = found
+        if entry is None:
+            try:
+                entry = self._locate_in_head(name)
+            except DownloadInterrupted:
+                raise
+            except Exception:
+                entry = None
         if entry is not None:
             self._head_entries[name] = entry
             return entry
@@ -1182,10 +1529,47 @@ class ZipPayloadTool:
                 return e
         return None
 
+    def _locate_in_head(self, name, grow_steps=None):
+        """共享头部缓冲快速定位：首次只取开头 8KB，扫描需要时才扩容。
+
+        缓冲在整个 ZipPayloadTool 生命周期内复用：定位 payload.bin 下载的
+        头部数据，后续定位 META-INF/com/android/metadata（get_ota_info）
+        直接命中同一缓冲，零额外请求。grow_steps 限制扩容次数（默认不限）。
+        """
+        pos = 0
+        if not self._head_data:
+            target_len = min(HEAD_SCAN_STEPS[0], self.file_size)
+            self._head_data = self.fetcher.read(0, target_len - 1)
+        max_steps = len(HEAD_SCAN_STEPS) if grow_steps is None else grow_steps
+        for step in range(1, max_steps + 1):
+            entry, pos, status = ZipUtils.scan_head_segment(self._head_data, name, pos)
+            if status == 'hit':
+                # 条目数据若已完整落在头部缓冲内（如开头的小文件 metadata），
+                # 直接缓存内容，读取时零额外请求
+                if entry["data_offset"] + entry["compressed_size"] <= len(self._head_data):
+                    entry["_content"] = bytes(
+                        self._head_data[entry["data_offset"]:
+                                        entry["data_offset"] + entry["compressed_size"]])
+                return entry
+            if status == 'abort':
+                return None  # 数据描述符等 → 回退中央目录
+            # need_more / done：当前窗口未命中 → 按步长扩容后继续
+            if len(self._head_data) >= min(self.file_size, HEAD_SCAN_MAX) \
+                    or step >= max_steps:
+                return None
+            target_len = min(len(self._head_data) + HEAD_SCAN_STEPS[step],
+                             self.file_size)
+            if target_len > len(self._head_data):
+                chunk = self.fetcher.read(len(self._head_data), target_len - 1)
+                self._head_data += chunk
+        return None
+
     def _read_entry_content(self, entry):
-        """读取条目完整内容（支持未压缩 / DEFLATE）"""
-        data = self.fetcher.read(entry["data_offset"],
-                                 entry["data_offset"] + entry["compressed_size"] - 1)
+        """读取条目完整内容（支持未压缩 / DEFLATE）；头部缓冲已缓存则直接取用。"""
+        data = entry.get("_content")
+        if data is None:
+            data = self.fetcher.read(entry["data_offset"],
+                                     entry["data_offset"] + entry["compressed_size"] - 1)
         if entry["method"] == 0:
             return data
         if entry["method"] == 8:
@@ -1193,16 +1577,25 @@ class ZipPayloadTool:
         raise ValueError(f"不支持的压缩方法: {entry['method']}")
 
     def _locate_payload_via_metadata(self):
-        """兜底：解析 META-INF/com/android/metadata 的 ota-property-files，
-        直接取 payload.bin 的纯数据偏移与大小（打包工具预计算，无需 ZIP 结构）。
-        同时顺带记录 payload_metadata.bin 大小用于校验。"""
+        """解析 META-INF/com/android/metadata 的 ota-property-files 定位 payload.bin。
+
+        返回：
+          条目 dict —— payload.bin 被登记（偏移/大小可用，纯数据起始）；
+          _PAYLOAD_ABSENT —— metadata 存在且含 property-files 索引，但未登记
+                            payload.bin（旧式 recovery/BLOCK 包），权威确认不存在；
+          None —— metadata 缺失或没有 property-files（无法判定，走其他路径）。
+        """
         try:
             meta = self._locate_entry("META-INF/com/android/metadata")
             if meta is None:
                 return None
             text = self._read_entry_content(meta).decode("utf-8", "replace")
+            has_props = ("ota-property-files" in text
+                         or "ota-streaming-property-files" in text)
             props = ZipUtils.parse_ota_property_files(text)
             if "payload.bin" not in props:
+                if has_props:
+                    return ZipPayloadTool._PAYLOAD_ABSENT
                 return None
             offset, size = props["payload.bin"]
             if not (0 < offset < self.file_size and offset + size <= self.file_size):
@@ -1235,6 +1628,7 @@ class ZipPayloadTool:
                 return None
         try:
             cd_data = self.fetcher.read(self._cd_offset, self._cd_offset + self._cd_size - 1)
+            self._cd_fingerprint = hashlib.sha256(cd_data).hexdigest()
             self._cd_entries = ZipUtils.scan_central_directory(cd_data)
         except DownloadInterrupted:
             raise
@@ -1286,7 +1680,8 @@ class ZipPayloadTool:
         try:
             (self._partitions_start, self._partitions, self._block_size,
              self._manifest_hash) = PayloadExtractor.parse_payload_header(
-                self.fetcher, self._payload_offset, self.file_size
+                self.fetcher, self._payload_offset, self.file_size,
+                read_cap=self.payload_metadata_size,  # 精确读取 manifest 区域
             )
         except Exception:
             return False
@@ -1301,16 +1696,20 @@ class ZipPayloadTool:
         return True
 
     def list_partitions(self):
-        """返回分区信息列表 ``[{name, image_size, download_size}, ...]``；
-        未找到 payload.bin 或清单解析失败返回 None。
+        """返回分区信息列表 ``[{name, image_size, download_size, kind}, ...]``。
+
+        kind 为 "payload"（A/B payload.bin 分区）或 "zip_img"（兼容模式：
+        旧式 recovery/BLOCK 包中 zip 根目录与 firmware-update/ 下的 *.img 镜像）。
+        无 payload.bin 也无镜像文件时返回 None。
         image_size 与提取产物实际大小一致（清单未记录大小时按 extent 推算）。"""
-        if not self._load_payload_info():
-            return None
-        return [{
-            "name": p.partition_name,
-            "image_size": PayloadExtractor._image_size(p, self._block_size),
-            "download_size": sum(op.data_length for op in p.operations),
-        } for p in self._partitions]
+        if self._load_payload_info():
+            return [{
+                "name": p.partition_name,
+                "image_size": PayloadExtractor._image_size(p, self._block_size),
+                "download_size": sum(op.data_length for op in p.operations),
+                "kind": "payload",
+            } for p in self._partitions]
+        return self._compat_partitions()
 
     def get_ota_info(self):
         """读取并解析 META-INF/com/android/metadata，返回键值字典。
@@ -1339,15 +1738,130 @@ class ZipPayloadTool:
             info[key] = value.strip().strip('"').strip("'")
         return info or None
 
+    def _compat_partitions(self):
+        """兼容模式：无 payload.bin 的旧式 recovery 包。
+
+        - kind "zip_img"：zip 根目录与 firmware-update/ 下的 *.img 镜像
+          （boot.img、dtbo.img…，直接下载）
+        - kind "legacy_dat"：system.new.dat(.br) + transfer.list 的全量分区
+          （brotli 解压 + 区间重放重建，见 LegacyPartitions）
+        返回列表或 None。
+        """
+        entries = self._load_cd_entries()
+        if not entries:
+            return None
+        by_name = {e["name"]: e for e in entries}
+        parts = []
+        seen = set()
+        for e in entries:
+            raw_name = e["name"]
+            base = None
+            if "/" not in raw_name:
+                base = raw_name
+            elif raw_name.startswith("firmware-update/"):
+                base = raw_name.rsplit("/", 1)[1]
+            if base and base.lower().endswith(".img"):
+                pname = base[:-4]
+                parts.append({
+                    "name": pname,
+                    "image_size": e["uncompressed_size"],
+                    "download_size": e["compressed_size"],
+                    "kind": "zip_img",
+                    "entry": raw_name,
+                })
+                seen.add(pname)
+            # 旧式 dat 分区（根目录 *.new.dat / *.new.dat.br）
+            if "/" in raw_name:
+                continue
+            if raw_name.endswith(".new.dat.br"):
+                pname = raw_name[:-len(".new.dat.br")]
+            elif raw_name.endswith(".new.dat"):
+                pname = raw_name[:-len(".new.dat")]
+            else:
+                continue
+            if pname in seen:
+                continue
+            seen.add(pname)
+            image_size = 0
+            list_name = pname + ".transfer.list"
+            if list_name in by_name:
+                try:
+                    list_entry = self._locate_entry(list_name)
+                    if list_entry is not None:
+                        text = self._read_entry_content(list_entry) \
+                            .decode("utf-8", "replace")
+                        blocks, _cmds = LegacyPartitions.parse_transfer_list(text)
+                        image_size = blocks * LEGACY_BLOCK
+                except Exception:
+                    image_size = 0
+            parts.append({
+                "name": pname,
+                "image_size": image_size,
+                "download_size": e["compressed_size"],
+                "kind": "legacy_dat",
+                "entry": raw_name,
+            })
+        return parts or None
+
     def extract_partition(self, name, output=None, on_written=None):
         """提取指定分区为镜像文件，成功返回 True。
-        分区不存在抛 PartitionNotFoundError；未找到 payload.bin 抛
-        FileNotFoundInZipError。默认输出 ``name.img``。
-        on_written：可选回调 (已写连续前缀字节数)，用于流式场景。"""
+        分区不存在抛 PartitionNotFoundError；默认输出 ``name.img``。
+
+        无 payload.bin 时自动进入兼容模式：从 zip 镜像文件（boot.img、
+        firmware-update/*.img 等）提取对应分区。
+        on_written：可选回调 (已写连续前缀字节数)，用于流式场景。
+        """
         if output is None:
             output = name + ".img"
         if not self._load_payload_info():
-            raise FileNotFoundInZipError("ZIP中未找到 payload.bin")
+            # 兼容模式：recovery/BLOCK 包镜像文件
+            for candidate in (name, name + ".img"):
+                try:
+                    entry = self._locate_entry(candidate)
+                except DownloadInterrupted:
+                    raise
+                if entry is None:
+                    continue
+                try:
+                    ok = FileExtractor.extract(self.fetcher, entry, output,
+                                               self.threads, self.on_progress)
+                    if not ok:
+                        self._remove_partial(output)
+                    return ok
+                except DownloadInterrupted:
+                    self._remove_partial(output)
+                    return False
+                except Exception:
+                    self._remove_partial(output)
+                    raise
+            # 兼容模式：旧式 dat 分区（X.new.dat / X.new.dat.br + transfer.list）
+            for suffix in (".new.dat.br", ".new.dat"):
+                try:
+                    data_entry = self._locate_entry(name + suffix)
+                except DownloadInterrupted:
+                    raise
+                if data_entry is None:
+                    continue
+                try:
+                    list_entry = self._locate_entry(name + ".transfer.list")
+                    if list_entry is None:
+                        raise ValueError(f"缺少 {name}.transfer.list")
+                    list_text = self._read_entry_content(list_entry) \
+                        .decode("utf-8", "replace")
+                    ok = LegacyPartitions.extract(
+                        self.fetcher, data_entry, list_text, output,
+                        self.on_progress)
+                    if not ok:
+                        self._remove_partial(output)
+                    return ok
+                except DownloadInterrupted:
+                    self._remove_partial(output)
+                    return False
+                except Exception:
+                    self._remove_partial(output)
+                    raise
+            raise PartitionNotFoundError(
+                f"未找到分区 '{name}'（该包无 payload.bin，也没有对应的镜像文件）")
         target = next((p for p in self._partitions if p.partition_name == name), None)
         if target is None:
             available = ", ".join(p.partition_name for p in self._partitions)
@@ -1372,7 +1886,7 @@ class ZipPayloadTool:
 
 
 # =====================================================================
-# 8. 模块级便捷函数（函数接口）
+# 9. 模块级便捷函数（函数接口）
 # =====================================================================
 
 def list_partitions(source, threads=DEFAULT_THREADS, on_progress=None):
@@ -1412,7 +1926,7 @@ def extract_file(source, name, output=None, threads=DEFAULT_THREADS, on_progress
 
 
 # =====================================================================
-# 9. 命令行 CLI（仅当以脚本方式运行时生效，与库 API 完全隔离）
+# 10. 命令行 CLI（仅当以脚本方式运行时生效，与库 API 完全隔离）
 # =====================================================================
 
 def _build_parser():
