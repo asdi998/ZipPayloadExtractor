@@ -100,7 +100,7 @@ CHUNK_SIZE = 1024 * 1024 * 4    # 普通文件分块下载的块大小（4MB）
 MAX_RETRIES = 6                 # 单次 Range 读取的应用层重试次数（CDN 断连场景）
 GROUP_READ_TRIES = 3            # 分区提取时一组数据的读取尝试次数（组级重试）
 DEFAULT_THREADS = 8             # 默认并发数（限速链接可调大，GUI/CLI 均可）
-__version__ = "3.3.0"
+__version__ = "3.3.1"
 HEAD_SCAN_STEPS = (8 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)  # 快速定位扩容窗口（8KB 起步）
 HEAD_SCAN_MAX = 4 * 1024 * 1024
 GROUP_TARGET = 8 * 1024 * 1024  # 合并读取的目标大小（8MB，大分区时保持大块）
@@ -318,52 +318,64 @@ class DataFetcher:
         206 响应的 Content-Range 携带总大小（RFC 要求），因此一个请求
         同时完成「取大小 + 取头部数据」，无需单独的 HEAD 请求。
         返回 (data, total_size)；服务器忽略 Range 时只取前 length 字节。
+        带应用层重试（与 _read_remote 一致）：这是初始化第一步请求，
+        CDN 中途断连时自动退避重试，不让一次连接抖动毁掉整个 load。
         """
         if not self.remote:
             data = self._read_local(0, length - 1)
             return data, os.path.getsize(self.source)
         headers = {"Range": f"bytes=0-{length - 1}"}
-        r = self._session().get(self.source, headers=headers,
-                                timeout=(5, 60), stream=True)
-        try:
-            if r.status_code == 206:
-                cr = r.headers.get("Content-Range", "")
-                total = int(cr.rsplit("/", 1)[1]) if "/" in cr else None
-                if total is None or total <= 0:
-                    raise IOError("服务器未返回 Content-Range 头")
-                chunks = []
-                got = 0
-                for chunk in r.iter_content(chunk_size=128 * 1024):
-                    if self.stop_event.is_set():
-                        raise DownloadInterrupted("操作已被中断")
-                    if chunk:
-                        chunks.append(chunk)
-                        got += len(chunk)
-                        if got >= length:
-                            break
-                r.close()
-                return b"".join(chunks), total
-            if r.status_code == 200:
-                # 服务器忽略 Range：只读取前 length 字节
-                total = r.headers.get("Content-Length")
-                chunks = []
-                got = 0
-                for chunk in r.iter_content(chunk_size=128 * 1024):
-                    if chunk:
-                        chunks.append(chunk)
-                        got += len(chunk)
-                        if got >= length:
-                            break
-                r.close()
-                if total is None:
-                    raise IOError("服务器未返回 Content-Length 头")
-                return b"".join(chunks), int(total)
-            r.raise_for_status()
-            raise IOError(f"HTTP {r.status_code}")
-        except requests.exceptions.RequestException as e:
+        last_error = None
+        for attempt in range(self.max_retries + 1):
             if self.stop_event.is_set():
-                raise DownloadInterrupted("操作已被中断") from e
-            raise IOError(f"读取远程文件头失败: {e}") from e
+                raise DownloadInterrupted("操作已被中断")
+            try:
+                r = self._session().get(self.source, headers=headers,
+                                        timeout=(5, 60), stream=True)
+                try:
+                    if r.status_code == 206:
+                        cr = r.headers.get("Content-Range", "")
+                        total = int(cr.rsplit("/", 1)[1]) if "/" in cr else None
+                        if total is None or total <= 0:
+                            raise IOError("服务器未返回 Content-Range 头")
+                        chunks = []
+                        got = 0
+                        for chunk in r.iter_content(chunk_size=128 * 1024):
+                            if self.stop_event.is_set():
+                                raise DownloadInterrupted("操作已被中断")
+                            if chunk:
+                                chunks.append(chunk)
+                                got += len(chunk)
+                                if got >= length:
+                                    break
+                        return b"".join(chunks), total
+                    if r.status_code == 200:
+                        # 服务器忽略 Range：只读取前 length 字节
+                        total = r.headers.get("Content-Length")
+                        chunks = []
+                        got = 0
+                        for chunk in r.iter_content(chunk_size=128 * 1024):
+                            if chunk:
+                                chunks.append(chunk)
+                                got += len(chunk)
+                                if got >= length:
+                                    break
+                        if total is None:
+                            raise IOError("服务器未返回 Content-Length 头")
+                        return b"".join(chunks), int(total)
+                    r.raise_for_status()
+                    raise IOError(f"HTTP {r.status_code}")
+                finally:
+                    r.close()
+            except DownloadInterrupted:
+                raise
+            except requests.exceptions.RequestException as e:
+                if self.stop_event.is_set():
+                    raise DownloadInterrupted("操作已被中断") from e
+                last_error = e
+                if attempt < self.max_retries:
+                    time.sleep(0.3 * (2 ** attempt))
+        raise IOError(f"读取远程文件头失败: {last_error}")
 
     def _read_local(self, start, end=None):
         if self._mmap is not None:

@@ -117,7 +117,7 @@ with zpe.ZipPayloadTool("https://example.com/update.zip", threads=16,
 ```bash
 py -3.13 -m nuitka --onefile --assume-yes-for-downloads --output-dir=build-nuitka \
   --include-package-data=certifi --enable-plugin=tk-inter --windows-console-mode=disable \
-  --product-name=ZipPayloadExtractor --product-version=3.3.0 \
+  --product-name=ZipPayloadExtractor --product-version=3.3.1 \
   --output-filename=ZipPayloadExtractorGUI.exe GUI.pyw
 ```
 
